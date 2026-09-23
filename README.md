@@ -50,6 +50,18 @@ docker compose up --build
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 
+启动后可先提交一条审计再导出 SARIF（容器通过命名卷持久化，重启后记录仍在）：
+
+```bash
+# 1) 提交审计，记录返回的 id
+curl -s -X POST http://localhost:8000/api/v1/audits \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "x‮evil.exe‬", "filename": "patch.diff"}' | jq .id
+# 2) 按 id 导出 SARIF 2.1.0（Content-Type: application/sarif+json）
+curl -s http://localhost:8000/api/v1/audits/1/sarif -o bidi-audit.sarif
+jq '.version, (.runs[0].results | length)' bidi-audit.sarif   # "2.1.0" / 1
+```
+
 ### 仅用 Docker
 
 ```bash
@@ -58,6 +70,8 @@ docker run -p 8000:8000 -v "$PWD/data:/data" bidi-audit
 ```
 
 容器启动时会自动执行 schema 初始化（`python -m app.init_db`）。
+导出 SARIF 与上面相同：`GET http://localhost:8000/api/v1/audits/{id}/sarif`；
+记录 id 不存在时返回 `404`。
 
 ### 本地运行（无 Docker）
 
@@ -181,6 +195,96 @@ curl 'http://localhost:8000/api/v1/audits?risk_level=critical&filename=patch&lim
 ### `GET /api/v1/audits/{id}` — 单条详情
 
 返回摘要、原始文本 `raw_text` 和完整解析结果 `result`。
+
+### `GET /api/v1/audits/{id}/sarif` — 导出 SARIF 2.1.0
+
+把**已保存**的审计记录转换为 [SARIF 2.1.0](https://sarifweb.azurewebsites.net/) JSON，
+可直接导入 GitHub code scanning、Azure DevOps SARIF 任务等代码扫描平台。
+
+- 为每个**控制符错误**（未闭合开启符、孤立 PDF/PDI、嵌套深度超限）和每个
+  **危险区段**（方向覆盖范围 / 未闭合作用域）分别生成一条 `result`，
+  并为实际出现的问题类别生成去重后的 `rule`（`bidi/unclosed-opener`、
+  `bidi/orphan-closer`、`bidi/nesting-depth`、`bidi/dangerous-span`）。
+- `level` 按该发现自身的 `risk` 映射：`info/low → note`、`medium/high → warning`、
+  `critical → error`。
+- `locations[].physicalLocation.region` 使用 SARIF 规定的 **UTF-16 码元列偏移**，
+  用数据库中保存的**原文逐行重新计算**（星面字符如 😀 占 2 列）；行、列均 1 起始，
+  `endColumn` 为排他边界。region 上附带逻辑顺序的 `snippet`（即 `escaped_preview`）。
+- location 的 `artifactLocation.uri` 取记录中的 `filename`；文件名为空时回退为
+  `audit-{id}`。
+- 每条 result 带稳定的 `partialFingerprints`，由规则 id、问题码点与受影响范围
+  （`start:end`）及 artifact uri 经 SHA-256 派生；同一文本重复审计指纹一致。
+- rules / results / 属性键均确定性排序，重复请求字节级一致。记录不存在返回 `404`。
+
+```bash
+curl -s http://localhost:8000/api/v1/audits/1/sarif | jq
+```
+
+响应（节选）：
+
+```json
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "bidi-audit",
+          "version": "1.0.0",
+          "rules": [
+            {
+              "id": "bidi/dangerous-span",
+              "name": "DangerousBidiSpan",
+              "defaultConfiguration": {"level": "warning"},
+              "properties": {"tags": ["bidi", "trojan-source", "unicode"]}
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "bidi/dangerous-span",
+          "level": "warning",
+          "message": {"text": "RLO dangerous span (logical index 1..10): RLO override forces visual reordering of enclosed characters"},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "patch.diff"},
+                "region": {
+                  "startLine": 1, "startColumn": 2,
+                  "endLine": 1, "endColumn": 11,
+                  "snippet": {"text": "⟨RLO⟩evil.exe"}
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "bidiAuditV1/sha256": "…",
+            "bidiAuditV1/codepoint": "U+202E",
+            "bidiAuditV1/range": "1:10",
+            "bidiAuditV1/ruleId": "bidi/dangerous-span"
+          }
+        }
+      ],
+      "artifacts": [{"location": {"uri": "patch.diff"}}],
+      "properties": {"auditId": 1, "riskLevel": "high", "errorCount": 0,
+                     "filenameMissing": false}
+    }
+  ]
+}
+```
+
+响应内容类型为 `application/sarif+json`。清洁文本（无错误也无危险区段）导出
+0 条 result 的合法 SARIF 报告。例如上传到 GitHub code scanning：
+
+```bash
+# Docker Compose 已在运行时，导出后用 sarif 上传工具提交
+curl -s http://localhost:8000/api/v1/audits/1/sarif -o bidi-audit.sarif
+# 例如 CI 中：gh api -H "Accept: application/sarif+json" \
+#   /repos/OWNER/REPO/code-scanning/sarifs \
+#   -f commit_sha=$GITHUB_SHA -f ref=refs/heads/main -F sarif=@bidi-audit.sarif
+```
 
 ### `POST /api/v1/audits/compare` — 结果回归比较
 
@@ -321,13 +425,16 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── database.py    # SQLite schema / CRUD / 查询
+│   ├── sarif.py       # 已存审计记录 → SARIF 2.1.0（UTF-16 列、稳定指纹）
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── main.py        # FastAPI 路由
 │   └── init_db.py     # 独立初始化入口（容器启动调用）
 ├── tests/
 │   ├── conftest.py    # 共享的临时 DB / TestClient fixture
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
-│   └── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
+│   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
+│   └── test_sarif.py  # SARIF 导出测试（rule/result、level 映射、UTF-16 列、
+│                      #   文件名回退、partialFingerprints、确定性、404）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -346,7 +453,10 @@ python -m pytest tests/ -q
 LRI/PDI 隔离配对、隔离内嵌入隐式关闭、PDF 跳过隔离层（X9）、行列定位、
 嵌套深度、转义预览，以及 API 的创建/详情/过滤/404；比较接口覆盖相同结果、
 新增/消失、仅位置平移、配对范围变化（孤立/配对对象/跨度）、按缩写与出现次序
-配对、标记配对、风险升级与错误数、以及 404 / 422 错误分支。
+配对、标记配对、风险升级与错误数、以及 404 / 422 错误分支；SARIF 导出覆盖
+四类 rule 生成、risk→level 映射、逐行 UTF-16 列（含星面字符与多行区段）、
+filename 缺失回退、partialFingerprints 的稳定/唯一/跨记录一致、输出排序
+确定性以及 404 分支。
 
 ## 设计说明
 
