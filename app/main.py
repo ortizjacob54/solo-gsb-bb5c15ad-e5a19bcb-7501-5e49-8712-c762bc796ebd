@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
+from .sarif import build_sarif
 from .schemas import AuditRequest, CompareRequest
 
 app = FastAPI(
@@ -89,6 +91,28 @@ def read_audit(audit_id: int) -> dict:
     return record
 
 
+@app.get(
+    "/api/v1/audits/{audit_id}/sarif",
+    response_class=JSONResponse,
+    responses={
+        200: {
+            "content": {"application/sarif+json": {}},
+            "description": "SARIF 2.1.0 document for the stored audit",
+        },
+        404: {"description": "audit record not found"},
+    },
+)
+def export_audit_sarif(audit_id: int) -> JSONResponse:
+    """Export one stored audit as a SARIF 2.1.0 document."""
+    record = get_audit(audit_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="audit record not found")
+    sarif = build_sarif(record)
+    return JSONResponse(
+        sarif, media_type="application/sarif+json; charset=utf-8"
+    )
+
+
 @app.get("/")
 def root() -> dict:
     return {
@@ -99,6 +123,7 @@ def root() -> dict:
             "POST /api/v1/audits/compare",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
+            "GET  /api/v1/audits/{id}/sarif",
             "GET  /health",
         ],
     }
